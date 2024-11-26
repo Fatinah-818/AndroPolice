@@ -20,6 +20,7 @@ AndroPolice is a powerful tool designed for analyzing Android APK files to detec
 ### Prerequisites
 
 - **Python 3.8 or later**
+- **Docker**: Ensure Docker is installed and running. [Download Docker](https://www.docker.com/)
 - Required Python libraries:
   - `scikit-learn`
   - `xgboost`
