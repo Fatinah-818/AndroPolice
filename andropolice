@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import json
+import pandas as pd
+import joblib
+import numpy as np
+import shutil
+from colorama import Fore, Style, init
+import argparse
+import logging
+
+# Initialize Colorama for styled output
+init(autoreset=True)
+
+# Setup logging
+logging.basicConfig(
+    filename='andropolice.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logging.info("AndroPolice started")
+
+def load_malware_hashes(hash_file):
+    """Load malware hashes from a file."""
+    with open(hash_file, 'r') as file:
+        return set(line.strip() for line in file.readlines())
+
+def run_analysis(apk_path):
+    apk_dir = os.path.dirname(apk_path)
+    samples_path = os.path.join(apk_dir, "samples")
+    os.makedirs(samples_path, exist_ok=True)
+    shutil.copy(apk_path, samples_path)
+
+    docker_command = f'docker run --rm -v "{apk_dir}:/app/apk" alexmyg/andropytool -s /app/apk/samples'
+    print("\n" + Fore.LIGHTRED_EX + "-" * 40)
+    print(Fore.YELLOW + "Running analysis...")
+
+    process = subprocess.Popen(docker_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = process.communicate()
+
+    print(Fore.GREEN + "Analysis Completed.")
+    print(Fore.LIGHTRED_EX + "-" * 40 + "\n")
+
+
+def find_json_file(apk_dir):
+    for root, dirs, files in os.walk(apk_dir):
+        for file in files:
+            if file.endswith("-analysis.json"):
+                return os.path.join(root, file)
+    return None
+
+
+def process_json_to_csv(json_file, output_csv):
+    with open(json_file, 'r', encoding='utf-8') as file:
+        data = json.load(file)
+
+    # Initialize a new row for the current APK
+    new_row = {
+        'hash': data.get('Pre_static_analysis', {}).get('sha256', 'N/A'),
+        'package_name': data.get('Static_analysis', {}).get('Package name', 'N/A'),
+        'main_activity': data.get('Static_analysis', {}).get('Main activity', 'N/A')
+    }
+
+    # Reset and populate permissions
+    permissions = data.get('Static_analysis', {}).get('Permissions', [])
+    for permission in permissions:
+        new_row[permission] = 1
+
+    # Reset and populate opcodes
+    opcodes = data.get('Static_analysis', {}).get('Opcodes', {})
+    for opcode, count in opcodes.items():
+        new_row[opcode] = count
+
+    # Reset and populate API calls
+    api_calls = data.get('Static_analysis', {}).get('API calls', {})
+    for api_call, count in api_calls.items():
+        new_row[api_call] = count
+
+    # Save the processed data to a CSV
+    new_row_df = pd.DataFrame([new_row])
+    new_row_df.to_csv(output_csv, index=False)
+    print(Fore.CYAN + f"Data extracted and saved to '{output_csv}'.")
+
+
+def make_predictions(output_csv, model_file, high_corr_columns_file, predictions_file):
+    test_data = pd.read_csv(output_csv, low_memory=False)
+
+    with open(high_corr_columns_file, 'r') as file:
+        high = [line.strip() for line in file.readlines()]
+    test_data.drop(columns=high, errors='ignore', inplace=True)
+
+    for col in test_data.select_dtypes(include=['object']).columns:
+        try:
+            test_data[col] = pd.to_numeric(test_data[col], errors='raise')
+        except ValueError:
+            test_data[col] = pd.to_numeric(test_data[col], errors='coerce')
+
+    numeric_cols = test_data.select_dtypes(include=np.number).columns
+    test_data[numeric_cols] = test_data[numeric_cols].fillna(test_data[numeric_cols].mean())
+
+    try:
+        rf_model = joblib.load(model_file)
+    except ModuleNotFoundError as e:
+        print(f"Error loading model: {e}")
+        return
+
+    model_features = rf_model.feature_names_in_
+    test_data = test_data.reindex(columns=model_features, fill_value=0)
+
+    predictions = rf_model.predict(test_data)
+    print(Fore.CYAN + f"Predictions for {output_csv}: {predictions}")
+    pd.DataFrame(predictions, columns=['Prediction']).to_csv(predictions_file, index=False)
+    print(Fore.GREEN + f"Predictions saved to '{predictions_file}'.")
+    return predictions
+
+
+def display_results(hash_value, dangerous_permissions, prediction, apk_name, malware_hashes):
+   # ASCII Art Title
+ 
+    
+    print(Fore.YELLOW + f"APK Hash: {hash_value}")  # Verify the hash value here
+    if hash_value in malware_hashes:
+        print(Fore.RED + Style.BRIGHT + "✅ Hash found in the malware dataset\n")
+    else:
+        print(Fore.GREEN + Style.BRIGHT + "❌ Hash Not found in the malware dataset\n")
+
+
+    print(Fore.RED + Style.BRIGHT + "Top 10 Dangerous Permissions:")
+    print(Fore.RED + "-" * 40)
+    print(Fore.YELLOW + "No.\tPermission")
+
+    for idx, permission in enumerate(dangerous_permissions[:10], 1):
+        print(f"{idx}\t{permission}")
+
+    print(Fore.RED + "-" * 40 + "\n")
+
+    print(Fore.GREEN + Style.BRIGHT + "Prediction Results:")
+    print(Fore.GREEN + "-" * 40)
+    result = "MALWARE" if prediction[0] == 1 else "BENIGN"
+    print(Fore.RED + f"APK: {result}" if prediction[0] == 1 else Fore.GREEN + f"APK: {result}")
+    print(Fore.GREEN + "-" * 40 + "\n")
+
+    print(Fore.BLUE + Style.BRIGHT + "Thank you for using AndroPolice!")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="AndroPolice: Analyzing APK files for malware detection.")
+    parser.add_argument("--apk", help="Path to the APK file to analyze.")
+    parser.add_argument("--version", action="version", version="AndroPolice 1.0")
+    args = parser.parse_args()
+
+    if not shutil.which("docker"):
+        print(Fore.RED + "Error: Docker is required but not installed.")
+        logging.error("Docker is not installed or not found in PATH.")
+        exit(1)
+
+    if not args.apk:
+        print(Fore.RED + "Error: APK file path is required. Use --help for usage information.")
+        return
+
+    apk_path = args.apk
+
+    if not os.path.isfile(apk_path) or not apk_path.endswith(".apk"):
+        print(Fore.RED + f"Error: {apk_path} is not a valid APK file.")
+        logging.error(f"Invalid APK file provided: {apk_path}")
+        return
+
+    malware_hashes_file = "/bin/AndroPolice/MalwareHash"
+    malware_hashes = load_malware_hashes(malware_hashes_file)
+
+    run_analysis(apk_path)
+
+    apk_dir = os.path.dirname(apk_path)
+    apk_file = os.path.basename(apk_path)
+
+    json_file = find_json_file(apk_dir)
+    if json_file:
+        base_name = os.path.splitext(apk_file)[0]
+        output_csv = f"Extracted_APK_Features_{base_name}.csv"
+        predictions_file = f"Predictions_{base_name}.csv"
+
+        process_json_to_csv(json_file, output_csv)
+
+        if not os.path.exists(output_csv):
+            print(Fore.RED + f"Error: CSV file {output_csv} was not created.")
+            return
+
+        csv_data = pd.read_csv(output_csv)
+        hash_value = csv_data['hash'][0]
+
+        dangerous_permissions = [
+            col for col in csv_data.columns if col.startswith("android.permission.") and csv_data[col][0] == 1
+        ]
+
+        prediction = make_predictions(output_csv, "/bin/AndroPolice/random_forest_model.joblib", "/bin/AndroPolice/high_correlation_columns.txt", predictions_file)
+
+        display_results(hash_value, dangerous_permissions, prediction, apk_file, malware_hashes)
+    else:
+        print(Fore.RED + f"Error: JSON file not found for {apk_file}.")
+
+
+
+if __name__ == "__main__":
+    main()
